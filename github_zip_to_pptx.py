@@ -2,11 +2,13 @@
 """
 Convert a GitHub.io / MkDocs Markdown ZIP archive into:
   1. A PowerPoint deck (.pptx) matching Scenario Course_NTICCReno_October 2026.pptx
-     with zero empty placeholders, automatic slide splitting to prevent text
-     overlap, and static dashboard screenshots.
+     with zero empty/master placeholders, deterministic 1-Markdown-page-per-slide
+     mapping, full preservation of Markdown/HTML/CSS/LaTeX page breaks, calibrated
+     Open Sans auto-fit scaling, proportional tables, adaptive image placement,
+     and static dashboard screenshots.
   2. A matching self-contained HTML presentation (.html) with the same visual
-     slide chrome, embedded images, and LIVE interactive Streamlit iframes on
-     the results slides.
+     slide chrome, layout rules, print page-break CSS, embedded images, and
+     LIVE interactive Streamlit iframes on the results slides.
 
 Usage:
     python github_zip_to_pptx.py hoopavalley.zip -o HoopaValley_Workshop.pptx \
@@ -21,6 +23,7 @@ import os
 import re
 import shutil
 import tempfile
+import urllib.parse
 import zipfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -57,11 +60,18 @@ FONT_FAMILY = "Open Sans"
 SLIDE_WIDTH = Inches(10.0)
 SLIDE_HEIGHT = Inches(5.625)
 
-CONTENT_TOP_START = 1.15      # Below 0.92" crimson banner
-MAX_CONTENT_BOTTOM = 4.92     # Above 5.11" NCDP footer / bottom margin
-CONTENT_LEFT = 0.58
-FULL_CONTENT_WIDTH = 8.85
-SPLIT_CONTENT_WIDTH = 5.35
+CONTENT_TOP_START = 1.00      # Below 0.92" crimson banner
+MAX_CONTENT_BOTTOM = 4.96     # Safely above bottom NCDP footer logo
+CONTENT_LEFT = 0.52
+FULL_CONTENT_WIDTH = 8.96
+SPLIT_CONTENT_WIDTH = 5.65
+IMAGE_RIGHT_LEFT = 6.32
+IMAGE_RIGHT_TOP = 1.12
+IMAGE_RIGHT_MAX_W = 3.22
+IMAGE_RIGHT_MAX_H = 3.65
+
+# Calibrated Open Sans average character width multiplier (prevents line-wrap underestimation)
+OPEN_SANS_CHAR_FACTOR = 0.54
 
 
 # ---------------------------------------------------------------------------
@@ -93,10 +103,13 @@ def extract_zip_and_locate_project(zip_path: str, work_dir: str) -> Tuple[Path, 
     return project_root, docs_dir, mkdocs_path
 
 
-def load_mkdocs_config(mkdocs_path: Optional[Path], docs_dir: Path) -> Tuple[str, List[str]]:
-    """Read site_name and ordered Markdown file list from mkdocs.yml (works with or without PyYAML)."""
+def load_mkdocs_config(mkdocs_path: Optional[Path], docs_dir: Path) -> Tuple[str, List[Tuple[str, str]]]:
+    """
+    Read site_name and ordered (nav_label, md_rel_path) entries from mkdocs.yml.
+    Preserves exact page ordering so each Markdown file remains its own slide unit.
+    """
     site_name = "Two-Way Emergency Communication Workshop"
-    nav_files: List[str] = []
+    nav_entries: List[Tuple[str, str]] = []
 
     if mkdocs_path and mkdocs_path.exists():
         raw = mkdocs_path.read_text(encoding="utf-8", errors="replace")
@@ -105,47 +118,98 @@ def load_mkdocs_config(mkdocs_path: Optional[Path], docs_dir: Path) -> Tuple[str
             cfg = yaml.safe_load(cleaned_yaml) or {}
             site_name = cfg.get("site_name", site_name)
 
-            def flatten_nav(items):
+            def flatten_nav(items, parent_label: str = ""):
                 for item in items or []:
                     if isinstance(item, str) and item.endswith(".md"):
-                        nav_files.append(item)
+                        label = parent_label or Path(item).stem.replace("_", " ").title()
+                        nav_entries.append((label, item))
                     elif isinstance(item, dict):
-                        for val in item.values():
+                        for key, val in item.items():
+                            key_str = str(key).strip()
                             if isinstance(val, str) and val.endswith(".md"):
-                                nav_files.append(val)
+                                nav_entries.append((key_str, val))
                             elif isinstance(val, list):
-                                flatten_nav(val)
+                                flatten_nav(val, key_str)
 
             flatten_nav(cfg.get("nav", []))
         else:
             m_site = re.search(r"^site_name:\s*(.+)$", raw, re.MULTILINE)
             if m_site:
                 site_name = m_site.group(1).strip().strip("\"'")
-            for m_md in re.finditer(r"['\"]([A-Za-z0-9_./-]+\.md)['\"]", raw):
-                nav_files.append(m_md.group(1))
+            for m_md in re.finditer(r"(?:([^:\n]+):\s*)?['\"]?([A-Za-z0-9_./-]+\.md)['\"]?", raw):
+                lbl = (m_md.group(1) or "").strip(" -'\"")
+                md_f = m_md.group(2).strip()
+                if not lbl:
+                    lbl = Path(md_f).stem.replace("_", " ").title()
+                nav_entries.append((lbl, md_f))
 
-    if not nav_files:
+    if not nav_entries:
         all_md = sorted(p.name for p in docs_dir.glob("*.md"))
         if "index.md" in all_md:
             all_md.remove("index.md")
-            nav_files = ["index.md"] + all_md
-        else:
-            nav_files = all_md
+            all_md = ["index.md"] + all_md
+        nav_entries = [(Path(f).stem.replace("_", " ").title(), f) for f in all_md]
 
-    return site_name, nav_files
+    return site_name, nav_entries
+
+
+def resolve_doc_image(src: str, docs_dir: Path, md_rel_path: str = "") -> Optional[Path]:
+    """Resolve an image src from Markdown/HTML relative to the markdown file or docs_dir."""
+    if not src:
+        return None
+    clean_src = urllib.parse.unquote(src.strip())
+    if clean_src.startswith(("http://", "https://", "data:")):
+        return None
+
+    rel_norm = clean_src.lstrip("./")
+    candidates = []
+    if md_rel_path:
+        md_parent = (docs_dir / md_rel_path).parent
+        candidates.append(md_parent / clean_src)
+        candidates.append(md_parent / rel_norm)
+    candidates.append(docs_dir / clean_src)
+    candidates.append(docs_dir / rel_norm)
+
+    for c in candidates:
+        if c.exists() and c.is_file():
+            return c
+
+    # Fallback: match filename anywhere under docs_dir (ignoring __MACOSX)
+    target_name = Path(rel_norm).name.lower()
+    for p in docs_dir.rglob("*"):
+        if "__MACOSX" not in p.parts and p.is_file() and p.name.lower() == target_name:
+            return p
+    return None
 
 
 # ---------------------------------------------------------------------------
-# Template & Slide Chrome Helpers (Zero Empty Placeholders)
+# Template & Slide Chrome Helpers (Zero Empty/Master Placeholders)
 # ---------------------------------------------------------------------------
+def _strip_prompt_placeholders_from_container(container):
+    """Remove any 'Click to edit...' or 'Click to add...' placeholder shapes from a master/layout."""
+    for shp in list(container.shapes):
+        has_prompt = False
+        if shp.has_text_frame:
+            txt = shp.text_frame.text.strip().lower()
+            if "click to edit" in txt or "click to add" in txt:
+                has_prompt = True
+        if has_prompt:
+            sp = shp._element
+            sp.getparent().remove(sp)
+
+
 def initialize_presentation(template_path: Optional[str]) -> Tuple[Presentation, bool]:
-    """Load template PPTX (clearing sample slides while keeping Master/Logos) or create blank 16:9 deck."""
+    """Load template PPTX (clearing sample slides & master prompts while keeping theme/logos) or create blank 16:9 deck."""
     if template_path and os.path.exists(template_path):
         prs = Presentation(template_path)
         for i in range(len(prs.slides) - 1, -1, -1):
             r_id = prs.slides._sldIdLst[i].rId
             prs.part.drop_rel(r_id)
             del prs.slides._sldIdLst[i]
+        for master in prs.slide_masters:
+            _strip_prompt_placeholders_from_container(master)
+            for layout in master.slide_layouts:
+                _strip_prompt_placeholders_from_container(layout)
         return prs, True
 
     prs = Presentation()
@@ -165,8 +229,9 @@ def get_layout(prs: Presentation, preferred_names: List[str]):
 
 def prune_unused_placeholders(slide, keep_title: bool = False):
     """
-    Remove all placeholder shapes from the slide XML so PowerPoint/Google Slides
-    never displays 'Click to add title', 'Click to add subtitle', or 'Click to add text'.
+    Remove all unused placeholder shapes (and any 'Click to edit/add...' shapes)
+    from the slide XML so PowerPoint/Google Slides/LibreOffice never displays
+    master placeholder prompts.
     """
     title_shp = None
     if keep_title:
@@ -176,10 +241,18 @@ def prune_unused_placeholders(slide, keep_title: bool = False):
             title_shp = None
 
     for shp in list(slide.shapes):
-        if shp.is_placeholder:
-            if keep_title and title_shp is not None and shp == title_shp:
-                continue
-            sp = shp._element
+        if keep_title and title_shp is not None and shp == title_shp:
+            continue
+
+        sp = shp._element
+        is_ph = shp.is_placeholder or (sp.find(".//" + qn("p:ph")) is not None)
+        has_prompt = False
+        if shp.has_text_frame:
+            txt = shp.text_frame.text.strip().lower()
+            if "click to edit" in txt or "click to add" in txt:
+                has_prompt = True
+
+        if is_ph or has_prompt:
             sp.getparent().remove(sp)
 
 
@@ -226,16 +299,16 @@ def apply_standalone_chrome(slide, slide_num: int, is_cover: bool = False):
 
 
 def create_clean_slide(prs: Presentation, using_template: bool, slide_num: int, is_cover: bool = False):
-    """Create a slide with all default 'Click to add...' placeholders stripped."""
+    """Create a slide with all default 'Click to edit/add...' placeholders stripped."""
     if is_cover:
-        layout = get_layout(prs, ["TITLE", "Title Slide", "Blank"])
+        layout = get_layout(prs, ["Blank", "Title Only", "TITLE_ONLY", "Title Slide"])
         slide = prs.slides.add_slide(layout)
         prune_unused_placeholders(slide, keep_title=False)
         if not using_template:
             apply_standalone_chrome(slide, slide_num, is_cover=True)
         return slide
 
-    layout = get_layout(prs, ["Title and Content", "TITLE_ONLY", "Blank"])
+    layout = get_layout(prs, ["Title and Content", "Title Only", "TITLE_ONLY", "Blank"])
     slide = prs.slides.add_slide(layout)
     has_title_ph = using_template and (slide.shapes.title is not None)
     prune_unused_placeholders(slide, keep_title=has_title_ph)
@@ -279,7 +352,7 @@ def set_slide_title(slide, title_text: str, using_template: bool, font_size_pt: 
 
 
 # ---------------------------------------------------------------------------
-# Inline Markdown Formatting & Height Estimation Helpers
+# Inline Markdown Formatting & Calibrated Height Estimation
 # ---------------------------------------------------------------------------
 INLINE_TOKEN_RE = re.compile(
     r"(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\([^)]+\)|\*[^*]+\*)"
@@ -312,14 +385,14 @@ def md_inline_to_html(text: str) -> str:
         elif tok.startswith("*") and tok.endswith("*"):
             out.append(f"<em>{html.escape(tok[1:-1])}</em>")
         else:
-            out.append(html.escape(tok))
+            out.append(html.escape(tok.replace("`", "")))
     return "".join(out)
 
 
 def add_formatted_runs(
     paragraph,
     text: str,
-    base_size_pt: float = 14.5,
+    base_size_pt: float = 12.5,
     base_color: RGBColor = COLOR_DARK,
     base_bold: bool = False,
     base_italic: bool = False,
@@ -365,7 +438,7 @@ def add_formatted_runs(
             r.font.color.rgb = base_color
         else:
             r = paragraph.add_run()
-            r.text = tok
+            r.text = tok.replace("`", "")
             r.font.name = FONT_FAMILY
             r.font.size = Pt(base_size_pt)
             r.font.bold = base_bold
@@ -376,87 +449,260 @@ def add_formatted_runs(
 def set_bullet_xml(paragraph, level: int = 0):
     """Enable native PowerPoint bullet formatting on a paragraph."""
     pPr = paragraph._p.get_or_add_pPr()
-    pPr.set("marL", str(int(Inches(0.28 + level * 0.25))))
-    pPr.set("indent", str(int(Inches(-0.18))))
+    pPr.set("marL", str(int(Inches(0.26 + level * 0.24))))
+    pPr.set("indent", str(int(Inches(-0.16))))
     buChar = pPr.find(qn("a:buChar"))
     if buChar is None:
         buChar = etree.SubElement(pPr, qn("a:buChar"))
     buChar.set("char", "•" if level == 0 else "▪")
 
 
-def estimate_text_height_in(text: str, width_in: float, font_pt: float, is_bullet: bool = False) -> float:
-    """Estimate the rendered height (in inches) of a wrapped paragraph or bullet."""
+def estimate_text_height_in(
+    text: str, width_in: float, font_pt: float, is_bullet: bool = False, compact: bool = False
+) -> float:
+    """Estimate the rendered height (in inches) of a wrapped paragraph or bullet using Open Sans metrics."""
     plain = strip_md_inline(text)
     if not plain:
-        return 0.22
-    effective_w = max(1.2, width_in - (0.35 if is_bullet else 0.14))
-    # Conservative Open Sans average glyph width (~0.53 * font_pt)
-    chars_per_line = max(12, int((effective_w * 72.0) / (font_pt * 0.54)))
-    lines = max(1, math.ceil(len(plain) / chars_per_line))
-    line_height_in = (font_pt * 1.32) / 72.0
-    extra_pad = 0.09 if is_bullet else 0.06
+        return 0.16
+    effective_w = max(1.2, width_in - (0.30 if is_bullet else 0.10))
+    chars_per_line = max(10, int((effective_w * 72.0) / (font_pt * OPEN_SANS_CHAR_FACTOR)))
+    effective_len = math.ceil(len(plain) * 1.06)
+    lines = max(1, math.ceil(effective_len / chars_per_line))
+    line_mult = 1.18 if compact else 1.24
+    line_height_in = (font_pt * line_mult) / 72.0
+    extra_pad = (0.03 if compact else 0.05) if is_bullet else (0.03 if compact else 0.04)
     return lines * line_height_in + extra_pad
 
 
-def estimate_table_height_in(rows: List[List[str]], width_in: float) -> float:
-    """Estimate total table height accounting for multi-line wrapped cells."""
+def compute_table_col_widths(rows: List[List[str]], total_width_in: float) -> List[float]:
+    """Allocate table column widths proportionally to content length so dense columns don't over-wrap."""
     if not rows:
-        return 0.5
+        return []
     n_cols = max(len(r) for r in rows)
-    col_w = max(1.0, width_in / max(1, n_cols))
+    if n_cols == 1:
+        return [total_width_in]
+
+    col_weights = []
+    for c in range(n_cols):
+        lengths = []
+        for r_idx, row in enumerate(rows):
+            txt = strip_md_inline(row[c]) if c < len(row) else ""
+            lengths.append(len(txt) * (0.8 if r_idx == 0 else 1.0))
+        max_len = max(lengths) if lengths else 8
+        avg_len = (sum(lengths) / len(lengths)) if lengths else 8
+        weight = max(6.0, 0.65 * max_len + 0.35 * avg_len)
+        col_weights.append(weight)
+
+    min_frac = 0.14 if n_cols <= 4 else 0.10
+    max_frac = 0.60
+    total_w = sum(col_weights)
+    fracs = [max(min_frac, min(max_frac, w / total_w)) for w in col_weights]
+    frac_sum = sum(fracs)
+    return [total_width_in * (f / frac_sum) for f in fracs]
+
+
+def estimate_table_height_in(
+    rows: List[List[str]], width_in: float, body_font_pt: float = 12.5, compact: bool = False
+) -> float:
+    """Estimate total table height accounting for proportional column widths and wrapped cells."""
+    if not rows:
+        return 0.40
+    col_widths = compute_table_col_widths(rows, width_in)
+    n_cols = len(col_widths)
     total_h = 0.0
+    header_pt = max(9.0, body_font_pt - 0.5)
+    cell_pt = max(8.5, body_font_pt - 1.0)
+    line_mult = 1.16 if compact else 1.22
+    cell_vpad = 0.06 if compact else 0.08
+    min_row_h = 0.25 if compact else 0.30
+
     for r_idx, row in enumerate(rows):
-        font_pt = 12.5 if r_idx == 0 else 12.0
+        font_pt = header_pt if r_idx == 0 else cell_pt
         max_lines = 1
-        for cell_txt in row:
+        for c_idx in range(n_cols):
+            cell_txt = row[c_idx] if c_idx < len(row) else ""
             plain = strip_md_inline(cell_txt)
-            chars_per_line = max(8, int(((col_w - 0.20) * 72.0) / (font_pt * 0.55)))
-            lines = max(1, math.ceil(len(plain) / chars_per_line))
+            col_w = col_widths[c_idx]
+            chars_per_line = max(6, int(((col_w - 0.16) * 72.0) / (font_pt * OPEN_SANS_CHAR_FACTOR)))
+            effective_len = math.ceil(len(plain) * 1.06)
+            lines = max(1, math.ceil(effective_len / chars_per_line))
             max_lines = max(max_lines, lines)
-        row_h = max(0.36, max_lines * ((font_pt * 1.28) / 72.0) + 0.14)
+        row_h = max(min_row_h, max_lines * ((font_pt * line_mult) / 72.0) + cell_vpad)
         total_h += row_h
     return total_h
 
 
+def estimate_blocks_total_height(
+    blocks: List[Dict], width_in: float, body_font_pt: float, compact: bool = False
+) -> float:
+    """Compute the total vertical height required by a list of blocks."""
+    sub_font_pt = max(8.5, body_font_pt - 1.0)
+    total = 0.0
+    for idx, b in enumerate(blocks):
+        if b["type"] == "table":
+            h = estimate_table_height_in(b["rows"], width_in, body_font_pt, compact=compact)
+            gap = 0.06 if compact else 0.09
+        elif b["type"] == "callout":
+            h = estimate_text_height_in(
+                b["text"], width_in - 0.28, body_font_pt + 0.5, is_bullet=False, compact=compact
+            ) + 0.12
+            gap = 0.05 if compact else 0.08
+        elif b["type"] == "subheading":
+            h = estimate_text_height_in(
+                b["text"], width_in, body_font_pt + 1.5, is_bullet=False, compact=compact
+            ) + (0.04 if idx > 0 else 0.0)
+            gap = 0.03 if compact else 0.05
+        elif b["type"] == "paragraph":
+            h = estimate_text_height_in(b["text"], width_in, body_font_pt, is_bullet=False, compact=compact)
+            gap = 0.04 if compact else 0.06
+        elif b["type"] == "bullets":
+            h = sum(
+                estimate_text_height_in(
+                    btxt, width_in, body_font_pt if lvl == 0 else sub_font_pt, is_bullet=True, compact=compact
+                )
+                for lvl, btxt in b["items"]
+            )
+            gap = 0.04 if compact else 0.06
+        else:
+            continue
+        total += h + (gap if idx < len(blocks) - 1 else 0.0)
+    return total
+
+
 # ---------------------------------------------------------------------------
-# Markdown Parser
+# HTML <img>, Page Break & Markdown Parser (1 Markdown Page = 1 Slide Unit)
 # ---------------------------------------------------------------------------
-def parse_markdown_sections(md_text: str) -> Dict:
+IMG_TAG_RE = re.compile(r"<img\b([^>]*)/?>", re.IGNORECASE | re.DOTALL)
+
+# Match HTML/CSS page breaks (e.g. <div style="page-break-after: always;"></div>, break-before: page)
+PAGE_BREAK_HTML_RE = re.compile(
+    r"""<(?:div|p|span|section|br|hr)\b[^>]*(?:page-break-(?:after|before)\s*:\s*always|break-(?:after|before)\s*:\s*page)[^>]*(?:/>|>\s*</(?:div|p|span|section)>|>)""",
+    re.IGNORECASE | re.DOTALL,
+)
+# Match class-based page/slide break elements (e.g. <div class="page-break"></div>, <hr class="pagebreak">)
+PAGE_BREAK_CLASS_RE = re.compile(
+    r"""<(?:div|p|span|hr|br)\b[^>]*\bclass\s*=\s*["'][^"']*\b(?:page-?break|new-?page|slide-?break)\b[^"']*["'][^>]*(?:/>|>\s*</(?:div|p|span)>|>)""",
+    re.IGNORECASE | re.DOTALL,
+)
+# Match HTML comment page/slide breaks (e.g. <!-- pagebreak -->, <!-- page-break -->, <!-- slide -->)
+PAGE_BREAK_COMMENT_RE = re.compile(
+    r"""<!--\s*(?:page-?break|new-?page|slide(?:-?break)?)\s*-->""",
+    re.IGNORECASE,
+)
+# Match LaTeX / Pandoc / Quarto page break commands (\newpage, \pagebreak)
+PAGE_BREAK_LATEX_RE = re.compile(
+    r"""^\s*\\(?:newpage|pagebreak)\s*$""",
+    re.MULTILINE,
+)
+# Match standalone HTML <hr> tags or Markdown thematic breaks (---, ***, ___, - - -)
+PAGE_BREAK_HR_TAG_RE = re.compile(
+    r"""<hr\b[^>]*/?>""",
+    re.IGNORECASE,
+)
+PAGE_BREAK_MD_HR_RE = re.compile(
+    r"""^\s*(?:-\s*-\s*-[-\s]*|\*\s*\*\s*\*[*\s]*|_\s*_\s*_[_\s]*)$""",
+    re.MULTILINE,
+)
+
+
+def normalize_page_breaks_to_markers(md_text: str) -> str:
     """
-    Parse a MkDocs Markdown file into structured slide units:
-    - page_title (# ...)
-    - iframe_url (if Streamlit embed exists)
-    - sms_callout (if 'To start the activity, send ...' block exists)
-    - sections (list of dicts with title and blocks)
+    Strip top-of-file YAML frontmatter if present, then convert all Markdown,
+    HTML/CSS (`page-break-after: always`, `break-before: page`, `.page-break`),
+    comment (`<!-- pagebreak -->`), LaTeX (`\\newpage`, `\\pagebreak`), and
+    form-feed (`\\f`) page breaks into standalone `[[PAGE_BREAK]]` lines before
+    HTML tag cleanup runs.
+    """
+    # Strip YAML frontmatter only when it opens at the very first line of the file
+    text = re.sub(r"\A---\s*\n.*?\n---\s*(?:\n|$)", "", md_text, count=1, flags=re.DOTALL)
+    text = text.replace("\x0c", "\n[[PAGE_BREAK]]\n")
+    text = PAGE_BREAK_HTML_RE.sub("\n[[PAGE_BREAK]]\n", text)
+    text = PAGE_BREAK_CLASS_RE.sub("\n[[PAGE_BREAK]]\n", text)
+    text = PAGE_BREAK_COMMENT_RE.sub("\n[[PAGE_BREAK]]\n", text)
+    text = PAGE_BREAK_LATEX_RE.sub("\n[[PAGE_BREAK]]\n", text)
+    text = PAGE_BREAK_HR_TAG_RE.sub("\n[[PAGE_BREAK]]\n", text)
+    text = PAGE_BREAK_MD_HR_RE.sub("\n[[PAGE_BREAK]]\n", text)
+    return text
+
+
+def parse_html_img_tag(tag_attrs: str) -> Optional[Dict]:
+    """Extract src, alt, and optional width from an HTML <img> tag's attribute string."""
+    src_m = re.search(r"""\bsrc\s*=\s*(?:["']([^"']+)["']|([^\s>]+))""", tag_attrs, re.IGNORECASE)
+    if not src_m:
+        return None
+    src = (src_m.group(1) or src_m.group(2) or "").strip()
+    if not src:
+        return None
+
+    alt_m = re.search(r"""\balt\s*=\s*(?:["']([^"']*)["']|([^\s>]+))""", tag_attrs, re.IGNORECASE)
+    alt = (alt_m.group(1) if alt_m and alt_m.group(1) is not None else (alt_m.group(2) if alt_m else "")).strip()
+
+    width_px = None
+    style_w = re.search(r"""width\s*:\s*(\d+)\s*px""", tag_attrs, re.IGNORECASE)
+    attr_w = re.search(r"""\bwidth\s*=\s*["']?(\d+)""", tag_attrs, re.IGNORECASE)
+    if style_w:
+        width_px = int(style_w.group(1))
+    elif attr_w:
+        width_px = int(attr_w.group(1))
+
+    return {"type": "image", "alt": alt, "src": src, "width_px": width_px}
+
+
+def normalize_html_images_to_markers(md_text: str) -> str:
+    """
+    Convert any <img ...> HTML tags into standalone `[[IMG_TOKEN:...]]` lines
+    before stripping layout HTML tags, so tags are never lost or shown raw.
+    """
+    def _repl(match: re.Match) -> str:
+        parsed = parse_html_img_tag(match.group(1))
+        if not parsed:
+            return ""
+        src_q = urllib.parse.quote(parsed["src"], safe="/:._-")
+        alt_q = urllib.parse.quote(parsed["alt"], safe="")
+        w_str = str(parsed["width_px"]) if parsed["width_px"] else ""
+        return f"\n[[IMG_TOKEN|{src_q}|{alt_q}|{w_str}]]\n"
+
+    return IMG_TAG_RE.sub(_repl, md_text)
+
+
+def _clean_inline_html(text: str) -> str:
+    """Convert inline HTML formatting tags to Markdown and strip stray container tags."""
+    text = re.sub(r"<br\s*/?>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"<(?:strong|b)\b[^>]*>(.*?)</(?:strong|b)>", r"**\1**", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<(?:em|i)\b[^>]*>(.*?)</(?:em|i)>", r"*\1*", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<[^>]+>", "", text)
+    return html.unescape(text).strip()
+
+
+def parse_markdown_sections(md_text: str, fallback_title: str = "Workshop Slide") -> Dict:
+    """
+    Parse a single MkDocs Markdown file into structured slide units:
+    - Keeps the entire Markdown page together as ONE slide section by default so
+      multiple sections/H2s on the same page stay together (and separate .md files
+      never merge).
+    - Splits into multiple slides whenever the Markdown writer inserts an explicit
+      page break (`---`, `***`, `___`, `<div style="page-break-after: always;"></div>`,
+      `<!-- pagebreak -->`, `\\newpage`, `\\pagebreak`, etc.).
     """
     iframe_match = re.search(r'<iframe[^>]+src=["\']([^"\']+)["\']', md_text, re.IGNORECASE)
     iframe_url = iframe_match.group(1).replace("&amp;", "&") if iframe_match else None
 
-    sms_callout = None
-    sms_match = re.search(
-        r"To start the activity,\s*send[^\n]*\n+([#*\sA-Za-z0-9_+-]+by text or WhatsApp to[^\n]+)\n+To end the activity at any time send\s+([^\n]+)",
-        md_text,
-        re.IGNORECASE | re.DOTALL,
-    )
-    if sms_match:
-        line1 = strip_md_inline(sms_match.group(1))
-        line2 = strip_md_inline(sms_match.group(2))
-        kw_match = re.match(r"^([A-Za-z0-9_-]+)\s+by text or WhatsApp to\s+(.+)$", line1, re.IGNORECASE)
-        if kw_match:
-            sms_callout = {
-                "keyword": kw_match.group(1).strip(),
-                "phone": kw_match.group(2).strip(),
-                "end_cmd": line2.strip(),
-            }
-        md_text = md_text[:sms_match.start()] + "\n" + md_text[sms_match.end():]
-
-    # Strip <style>, <div id="slide-config">, and <iframe> tags
-    cleaned = re.sub(r"<style>.*?</style>", "", md_text, flags=re.DOTALL | re.IGNORECASE)
-    cleaned = re.sub(r"<div[^>]*>.*?</div>", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    # Normalize explicit page breaks & HTML <img> tags BEFORE stripping HTML layout tags
+    cleaned = normalize_page_breaks_to_markers(md_text)
+    cleaned = normalize_html_images_to_markers(cleaned)
+    cleaned = re.sub(r"<style>.*?</style>", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<h1\b[^>]*>(.*?)</h1>", lambda m: f"\n# {_clean_inline_html(m.group(1))}\n", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<h2\b[^>]*>(.*?)</h2>", lambda m: f"\n## {_clean_inline_html(m.group(1))}\n", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<h3\b[^>]*>(.*?)</h3>", lambda m: f"\n### {_clean_inline_html(m.group(1))}\n", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<div[^>]*>", "\n", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"</div>", "\n", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"<p[^>]*>", "\n", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"</p>", "\n", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"<iframe[^>]*>.*?</iframe>", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"^\s*Loading live results(?:…|\.\.\.)\s*$", "", cleaned, flags=re.MULTILINE)
 
     lines = cleaned.splitlines()
-    page_title = "Workshop Slide"
+    page_title = fallback_title
     sections = []
     current = {"title": None, "blocks": []}
 
@@ -469,64 +715,114 @@ def parse_markdown_sections(md_text: str) -> Dict:
             i += 1
             continue
 
-        if stripped.startswith("# ") and not stripped.startswith("## "):
-            page_title = strip_md_inline(stripped[2:])
-            if current["title"] is None:
-                current["title"] = page_title
-            i += 1
-            continue
-
-        if stripped.startswith("## "):
+        # Explicit page break in the Markdown file -> enforce a new slide
+        if stripped == "[[PAGE_BREAK]]":
             if current["blocks"]:
+                if current["title"] is None:
+                    current["title"] = page_title
                 sections.append(current)
-            current = {"title": strip_md_inline(stripped[3:]), "blocks": []}
+                current = {"title": None, "blocks": []}
             i += 1
             continue
 
-        img_m = re.match(r"^!\[([^\]]*)\]\(([^)]+)\)$", stripped)
+        # Top-level H1 title
+        if stripped.startswith("# ") and not stripped.startswith("## "):
+            h1_clean = strip_md_inline(_clean_inline_html(stripped[2:]))
+            if h1_clean:
+                page_title = h1_clean
+                if current["title"] is None:
+                    current["title"] = page_title
+            i += 1
+            continue
+
+        # H2 / H3 headings:
+        # - If this is the very first line on a new slide right after a page break,
+        #   use it as that slide's title; otherwise render it as an in-slide subheading.
+        if stripped.startswith("## ") or stripped.startswith("### "):
+            raw_h = stripped.lstrip("#").strip()
+            h_clean = _clean_inline_html(raw_h)
+            if h_clean:
+                if re.search(r"by text or WhatsApp to", h_clean, re.IGNORECASE):
+                    current["blocks"].append({"type": "callout", "text": h_clean})
+                elif current["title"] is None and not current["blocks"] and len(sections) > 0:
+                    current["title"] = strip_md_inline(h_clean)
+                else:
+                    current["blocks"].append({"type": "subheading", "text": strip_md_inline(h_clean)})
+            i += 1
+            continue
+
+        # Normalized HTML <img> token
+        tok_m = re.match(r"^\[\[IMG_TOKEN\|([^|]*)\|([^|]*)\|([^]]*)\]\]$", stripped)
+        if tok_m:
+            src_val = urllib.parse.unquote(tok_m.group(1))
+            alt_val = urllib.parse.unquote(tok_m.group(2))
+            w_val = int(tok_m.group(3)) if tok_m.group(3).isdigit() else None
+            current["blocks"].append({"type": "image", "alt": alt_val, "src": src_val, "width_px": w_val})
+            i += 1
+            continue
+
+        # Standard Markdown image ![alt](src) or ![alt](src "title")
+        img_m = re.match(r"""^!\[([^\]]*)\]\(([^)\s]+)(?:\s+["'][^"']*["'])?\)$""", stripped)
         if img_m:
-            current["blocks"].append({"type": "image", "alt": img_m.group(1), "src": img_m.group(2).strip()})
+            current["blocks"].append({
+                "type": "image",
+                "alt": img_m.group(1),
+                "src": img_m.group(2).strip(),
+                "width_px": None,
+            })
             i += 1
             continue
 
+        # Markdown pipe table
         if stripped.startswith("|") and i + 1 < len(lines) and re.match(r"^\|[\s:|-]+\|$", lines[i + 1].strip()):
             table_rows = []
             while i < len(lines) and lines[i].strip().startswith("|"):
                 row_str = lines[i].strip()
                 if not re.match(r"^\|[\s:|-]+\|$", row_str):
-                    cells = [c.strip() for c in row_str.strip("|").split("|")]
+                    cells = [_clean_inline_html(c) for c in row_str.strip("|").split("|")]
                     table_rows.append(cells)
                 i += 1
             if table_rows:
                 current["blocks"].append({"type": "table", "rows": table_rows})
             continue
 
+        # Bullet list (skip empty list items so blank bullets never render)
         if re.match(r"^(\s*)[-*+]\s+", line):
             bullets = []
-            while i < len(lines) and re.match(r"^(\s*)[-*+]\s+", lines[i]):
-                m = re.match(r"^(\s*)[-*+]\s+(.*)$", lines[i])
+            while i < len(lines) and re.match(r"^(\s*)[-*+]\s*(.*)$", lines[i]):
+                m = re.match(r"^(\s*)[-*+]\s*(.*)$", lines[i])
                 indent_spaces = len(m.group(1))
                 lvl = 1 if indent_spaces >= 2 else 0
-                bullets.append((lvl, m.group(2).strip()))
+                item_txt = _clean_inline_html(m.group(2))
+                if item_txt:
+                    bullets.append((lvl, item_txt))
                 i += 1
-            current["blocks"].append({"type": "bullets", "items": bullets})
+            if bullets:
+                current["blocks"].append({"type": "bullets", "items": bullets})
             continue
 
-        para_lines = [stripped]
+        # Standard paragraph
+        para_lines = [_clean_inline_html(stripped)]
         i += 1
         while i < len(lines):
             nxt = lines[i].strip()
             if (
                 not nxt
+                or nxt == "[[PAGE_BREAK]]"
                 or nxt.startswith("#")
                 or nxt.startswith("|")
+                or nxt.startswith("[[IMG_TOKEN|")
                 or re.match(r"^[-*+]\s+", nxt)
                 or re.match(r"^!\[", nxt)
             ):
                 break
-            para_lines.append(nxt)
+            cleaned_nxt = _clean_inline_html(nxt)
+            if cleaned_nxt:
+                para_lines.append(cleaned_nxt)
             i += 1
-        current["blocks"].append({"type": "paragraph", "text": " ".join(para_lines)})
+        joined_para = " ".join(p for p in para_lines if p).strip()
+        if joined_para:
+            current["blocks"].append({"type": "paragraph", "text": joined_para})
 
     if current["blocks"] or not sections:
         if current["title"] is None:
@@ -536,7 +832,6 @@ def parse_markdown_sections(md_text: str) -> Dict:
     return {
         "page_title": page_title,
         "iframe_url": iframe_url,
-        "sms_callout": sms_callout,
         "sections": sections,
     }
 
@@ -544,16 +839,29 @@ def parse_markdown_sections(md_text: str) -> Dict:
 # ---------------------------------------------------------------------------
 # Slide Builders (PPTX + Structured Slide Models for HTML Output)
 # ---------------------------------------------------------------------------
-def add_picture_fit(slide, img_path: Path, left: float, top: float, max_w: float, max_h: float):
+def add_picture_fit(
+    slide,
+    img_path: Path,
+    left: float,
+    top: float,
+    max_w: float,
+    max_h: float,
+    width_px_hint: Optional[int] = None,
+    respect_width_hint: bool = True,
+):
     """Insert an image scaled proportionally within (max_w, max_h) and centered in the box."""
     with Image.open(img_path) as im:
         w_px, h_px = im.size
     aspect = w_px / float(h_px)
-    box_aspect = max_w / float(max_h)
 
+    effective_max_w = max_w
+    if respect_width_hint and width_px_hint is not None and width_px_hint > 0:
+        effective_max_w = min(max_w, max(1.8, width_px_hint / 96.0))
+
+    box_aspect = effective_max_w / float(max_h)
     if aspect >= box_aspect:
-        final_w = max_w
-        final_h = max_w / aspect
+        final_w = effective_max_w
+        final_h = effective_max_w / aspect
     else:
         final_h = max_h
         final_w = max_h * aspect
@@ -570,17 +878,27 @@ def build_cover_slide(
     subtitle: str,
     hero_img: Optional[Path],
     html_slides: List[Dict],
+    hero_width_px: Optional[int] = None,
 ):
-    """Build Slide 1 cover slide for both PPTX and HTML."""
+    """Build Slide 1 cover slide for both PPTX and HTML without any Master placeholder prompts."""
     slide = create_clean_slide(prs, using_template, 1, is_cover=True)
 
     if hero_img and hero_img.exists():
-        add_picture_fit(slide, hero_img, left=0.75, top=1.35, max_w=3.75, max_h=3.55)
+        add_picture_fit(
+            slide,
+            hero_img,
+            left=0.70,
+            top=1.25,
+            max_w=3.85,
+            max_h=3.60,
+            width_px_hint=hero_width_px,
+            respect_width_hint=True,
+        )
         text_left, text_w = 4.70, 4.90
     else:
         text_left, text_w = 1.00, 8.00
 
-    title_box = slide.shapes.add_textbox(Inches(text_left), Inches(1.85), Inches(text_w), Inches(2.50))
+    title_box = slide.shapes.add_textbox(Inches(text_left), Inches(1.80), Inches(text_w), Inches(2.50))
     tf = title_box.text_frame
     tf.word_wrap = True
     tf.vertical_anchor = MSO_ANCHOR.MIDDLE
@@ -609,82 +927,6 @@ def build_cover_slide(
     })
 
 
-def build_sms_activity_slide(
-    prs: Presentation,
-    using_template: bool,
-    slide_num: int,
-    slide_title: str,
-    sms_info: Dict[str, str],
-    results_url: Optional[str],
-    html_slides: List[Dict],
-):
-    """Build the light-gray rounded SMS prompt card slide."""
-    slide = create_clean_slide(prs, using_template, slide_num, is_cover=False)
-    set_slide_title(slide, slide_title, using_template)
-
-    card = slide.shapes.add_shape(
-        MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.45), Inches(1.55), Inches(9.10), Inches(2.85)
-    )
-    card.adjustments[0] = 0.04
-    card.fill.solid()
-    card.fill.fore_color.rgb = COLOR_CARD_BG
-    card.line.fill.background()
-
-    tf = card.text_frame
-    tf.word_wrap = True
-    tf.vertical_anchor = MSO_ANCHOR.MIDDLE
-    tf.margin_left = Inches(0.4)
-    tf.margin_right = Inches(0.4)
-
-    p1 = tf.paragraphs[0]
-    p1.alignment = PP_ALIGN.CENTER
-    p1.space_after = Pt(10)
-    add_formatted_runs(
-        p1,
-        f"To start the activity, send **{sms_info['keyword']}** by text or WhatsApp to",
-        base_size_pt=24,
-        base_color=COLOR_DARK,
-    )
-
-    p2 = tf.add_paragraph()
-    p2.alignment = PP_ALIGN.CENTER
-    p2.space_after = Pt(14)
-    r_phone = p2.add_run()
-    r_phone.text = sms_info["phone"]
-    r_phone.font.name = FONT_FAMILY
-    r_phone.font.size = Pt(30)
-    r_phone.font.bold = True
-    r_phone.font.color.rgb = COLOR_DARK
-
-    p3 = tf.add_paragraph()
-    p3.alignment = PP_ALIGN.CENTER
-    add_formatted_runs(
-        p3,
-        f"To end the activity at any time send **{sms_info['end_cmd']}**",
-        base_size_pt=22,
-        base_color=COLOR_DARK,
-    )
-
-    if results_url:
-        link_box = slide.shapes.add_textbox(Inches(0.55), Inches(4.62), Inches(3.60), Inches(0.35))
-        ltf = link_box.text_frame
-        lp = ltf.paragraphs[0]
-        lr = lp.add_run()
-        lr.text = "Latest Results (Live Dashboard)"
-        lr.font.name = FONT_FAMILY
-        lr.font.size = Pt(11.5)
-        lr.font.color.rgb = COLOR_LINK
-        lr.hyperlink.address = results_url
-
-    html_slides.append({
-        "type": "sms",
-        "num": slide_num,
-        "title": strip_md_inline(slide_title),
-        "sms_info": sms_info,
-        "results_url": results_url,
-    })
-
-
 def build_results_dashboard_slide(
     prs: Presentation,
     using_template: bool,
@@ -697,20 +939,20 @@ def build_results_dashboard_slide(
     """
     Build a Streamlit results slide:
       - PPTX: embeds captured PNG screenshot + live URL link
-      - HTML: embeds LIVE interactive Streamlit <iframe>!
+      - HTML: embeds LIVE interactive Streamlit <iframe>
     """
     slide = create_clean_slide(prs, using_template, slide_num, is_cover=False)
     set_slide_title(slide, slide_title, using_template)
 
     if screenshot_path and screenshot_path.exists():
         frame = slide.shapes.add_shape(
-            MSO_SHAPE.RECTANGLE, Inches(0.65), Inches(1.12), Inches(8.70), Inches(3.62)
+            MSO_SHAPE.RECTANGLE, Inches(0.65), Inches(1.10), Inches(8.70), Inches(3.52)
         )
         frame.fill.solid()
         frame.fill.fore_color.rgb = COLOR_WHITE
         frame.line.color.rgb = COLOR_BORDER
         frame.line.width = Pt(1.0)
-        add_picture_fit(slide, screenshot_path, left=0.70, top=1.16, max_w=8.60, max_h=3.54)
+        add_picture_fit(slide, screenshot_path, left=0.70, top=1.14, max_w=8.60, max_h=3.44, respect_width_hint=False)
     else:
         card = slide.shapes.add_shape(
             MSO_SHAPE.ROUNDED_RECTANGLE, Inches(0.85), Inches(1.65), Inches(8.30), Inches(2.40)
@@ -729,14 +971,14 @@ def build_results_dashboard_slide(
         r.font.bold = True
         r.font.color.rgb = COLOR_DARK
 
-    url_box = slide.shapes.add_textbox(Inches(3.60), Inches(4.80), Inches(5.90), Inches(0.35))
+    url_box = slide.shapes.add_textbox(Inches(3.40), Inches(4.68), Inches(6.10), Inches(0.32))
     utf = url_box.text_frame
     up = utf.paragraphs[0]
     up.alignment = PP_ALIGN.RIGHT
     ur = up.add_run()
     ur.text = f"Open Live Results: {iframe_url}"
     ur.font.name = FONT_FAMILY
-    ur.font.size = Pt(10.5)
+    ur.font.size = Pt(10.0)
     ur.font.color.rgb = COLOR_LINK
     ur.hyperlink.address = iframe_url
 
@@ -748,28 +990,45 @@ def build_results_dashboard_slide(
     })
 
 
-def render_styled_table(slide, rows: List[List[str]], left: float, top: float, width: float, height: float):
-    """Render a Markdown table into a formatted PowerPoint table matching the crimson/gray palette."""
+def render_styled_table(
+    slide,
+    rows: List[List[str]],
+    left: float,
+    top: float,
+    width: float,
+    height: float,
+    body_font_pt: float = 12.5,
+    compact: bool = False,
+):
+    """Render a Markdown table into a formatted PowerPoint table with proportional column widths."""
     n_rows = len(rows)
     n_cols = max(len(r) for r in rows)
     table_shape = slide.shapes.add_table(n_rows, n_cols, Inches(left), Inches(top), Inches(width), Inches(height))
     table = table_shape.table
 
+    col_widths = compute_table_col_widths(rows, width)
+    for c_idx, cw in enumerate(col_widths):
+        table.columns[c_idx].width = Inches(cw)
+
+    header_pt = max(9.0, body_font_pt - 0.5)
+    cell_pt = max(8.5, body_font_pt - 1.0)
+    v_margin = Inches(0.025 if compact else 0.04)
+
     for r_idx, row in enumerate(rows):
         is_header = r_idx == 0
         bg_color = COLOR_CRIMSON if is_header else (COLOR_ALT_ROW if r_idx % 2 == 1 else COLOR_WHITE)
         txt_color = COLOR_WHITE if is_header else COLOR_DARK
-        font_sz = 12.5 if is_header else 12.0
+        font_sz = header_pt if is_header else cell_pt
 
         for c_idx in range(n_cols):
             cell = table.cell(r_idx, c_idx)
             cell.fill.solid()
             cell.fill.fore_color.rgb = bg_color
             cell.vertical_anchor = MSO_ANCHOR.MIDDLE
-            cell.margin_left = Inches(0.10)
-            cell.margin_right = Inches(0.10)
-            cell.margin_top = Inches(0.05)
-            cell.margin_bottom = Inches(0.05)
+            cell.margin_left = Inches(0.07)
+            cell.margin_right = Inches(0.07)
+            cell.margin_top = v_margin
+            cell.margin_bottom = v_margin
 
             tf = cell.text_frame
             tf.word_wrap = True
@@ -779,12 +1038,45 @@ def render_styled_table(slide, rows: List[List[str]], left: float, top: float, w
             add_formatted_runs(p, val, base_size_pt=font_sz, base_color=txt_color, base_bold=is_header)
 
 
-def expand_splittable_blocks(blocks: List[Dict], width_in: float) -> List[Dict]:
+def choose_best_fit_for_section(
+    blocks: List[Dict],
+    width_in: float,
+    base_font_pt: float,
+    min_font_pt: float,
+    available_h: Optional[float] = None,
+) -> Tuple[float, bool]:
+    """
+    Choose the largest font size between `base_font_pt` and `min_font_pt` (and compact spacing
+    if needed) that allows the entire slide section to fit on ONE slide without overlapping or
+    splitting. Only splits onto `(Cont.)` if `min_font_pt` + compact mode still overflows.
+    """
+    if available_h is None:
+        available_h = MAX_CONTENT_BOTTOM - CONTENT_TOP_START
+
+    if estimate_blocks_total_height(blocks, width_in, base_font_pt, compact=False) <= available_h:
+        return base_font_pt, False
+
+    if estimate_blocks_total_height(blocks, width_in, base_font_pt, compact=True) <= available_h:
+        return base_font_pt, True
+
+    curr = base_font_pt - 0.5
+    while curr >= min_font_pt - 1e-6:
+        if estimate_blocks_total_height(blocks, width_in, curr, compact=True) <= available_h:
+            return round(curr, 2), True
+        curr -= 0.5
+
+    return min_font_pt, True
+
+
+def expand_splittable_blocks(
+    blocks: List[Dict], width_in: float, body_font_pt: float, compact: bool = False
+) -> List[Dict]:
     """
     Break oversized bullet lists or tables into smaller chunks so a single block
     never overflows a slide vertically, while keeping normal blocks intact.
     """
-    max_single_slide_h = MAX_CONTENT_BOTTOM - CONTENT_TOP_START - 0.10
+    max_single_slide_h = MAX_CONTENT_BOTTOM - CONTENT_TOP_START - 0.04
+    sub_font_pt = max(8.5, body_font_pt - 1.0)
     expanded: List[Dict] = []
 
     for b in blocks:
@@ -792,8 +1084,8 @@ def expand_splittable_blocks(blocks: List[Dict], width_in: float) -> List[Dict]:
             chunk: List[Tuple[int, str]] = []
             chunk_h = 0.0
             for lvl, btext in b["items"]:
-                font_pt = 14.0 if lvl == 0 else 13.0
-                item_h = estimate_text_height_in(btext, width_in, font_pt, is_bullet=True)
+                font_pt = body_font_pt if lvl == 0 else sub_font_pt
+                item_h = estimate_text_height_in(btext, width_in, font_pt, is_bullet=True, compact=compact)
                 if chunk and (chunk_h + item_h > max_single_slide_h):
                     expanded.append({"type": "bullets", "items": chunk})
                     chunk = [(lvl, btext)]
@@ -808,7 +1100,7 @@ def expand_splittable_blocks(blocks: List[Dict], width_in: float) -> List[Dict]:
             data_rows = b["rows"][1:]
             curr_rows = [header]
             for r in data_rows:
-                cand_h = estimate_table_height_in(curr_rows + [r], width_in)
+                cand_h = estimate_table_height_in(curr_rows + [r], width_in, body_font_pt, compact=compact)
                 if len(curr_rows) > 1 and cand_h > max_single_slide_h:
                     expanded.append({"type": "table", "rows": curr_rows})
                     curr_rows = [header, r]
@@ -822,6 +1114,46 @@ def expand_splittable_blocks(blocks: List[Dict], width_in: float) -> List[Dict]:
     return expanded
 
 
+def classify_image_layout(blocks: List[Dict], non_images: List[Dict], body_font_pt: float) -> str:
+    """
+    Determine image placement based on text volume on the slide:
+      - If there is only a line or two of text (no tables/subheadings, <= 1 bullet, <= 150 chars,
+        and <= 0.65" tall across full width), stack the image ABOVE ("top") or BELOW ("bottom")
+        the text according to the Markdown block order.
+      - Otherwise (a lot of text/bullets/table), place the image on the RIGHT ("right") with
+        text on the left.
+    """
+    if not non_images:
+        return "top"
+
+    has_table = any(b["type"] == "table" for b in non_images)
+    has_subheading = any(b["type"] == "subheading" for b in non_images)
+    total_bullets = sum(len(b["items"]) for b in non_images if b["type"] == "bullets")
+
+    plain_chunks = []
+    for b in non_images:
+        if b["type"] in ("paragraph", "callout", "subheading"):
+            plain_chunks.append(strip_md_inline(b["text"]))
+        elif b["type"] == "bullets":
+            plain_chunks.extend(strip_md_inline(txt) for _, txt in b["items"])
+    total_chars = sum(len(c) for c in plain_chunks)
+    est_full_h = estimate_blocks_total_height(non_images, FULL_CONTENT_WIDTH, body_font_pt, compact=False)
+
+    is_short_caption = (
+        not has_table
+        and not has_subheading
+        and total_bullets <= 1
+        and total_chars <= 150
+        and est_full_h <= 0.65
+    )
+    if not is_short_caption:
+        return "right"
+
+    first_img_idx = next((i for i, b in enumerate(blocks) if b["type"] == "image"), 0)
+    first_txt_idx = next((i for i, b in enumerate(blocks) if b["type"] != "image"), 1)
+    return "top" if first_img_idx < first_txt_idx else "bottom"
+
+
 def build_content_slides(
     prs: Presentation,
     using_template: bool,
@@ -829,85 +1161,200 @@ def build_content_slides(
     slide_title: str,
     blocks: List[Dict],
     docs_dir: Path,
+    md_rel_path: str,
     html_slides: List[Dict],
+    body_font_pt: float = 12.5,
+    min_font_pt: float = 9.5,
 ) -> int:
     """
-    Build one or more content slides from `blocks`, automatically splitting onto
-    continuation slides ('Title (Cont.)') whenever vertical height would exceed
-    MAX_CONTENT_BOTTOM so text boxes and tables never overlap.
-    Returns the next available slide number.
+    Build one or more content slides from `blocks`, automatically auto-fitting
+    font size down to `min_font_pt` first so each slide section stays on a single
+    slide with zero text overlap, and placing images either on the right (when
+    there is substantial text) or above/below (when there is only a line or two).
     """
     images = [b for b in blocks if b["type"] == "image"]
     non_images = [b for b in blocks if b["type"] != "image"]
 
     has_image = False
     img_path = None
+    img_width_px = None
     if images:
-        candidate = docs_dir / images[0]["src"]
-        if candidate.exists():
+        candidate = resolve_doc_image(images[0]["src"], docs_dir, md_rel_path)
+        if candidate is not None:
             has_image = True
             img_path = candidate
+            img_width_px = images[0].get("width_px")
 
-    content_width = SPLIT_CONTENT_WIDTH if has_image else FULL_CONTENT_WIDTH
-    prepared_blocks = expand_splittable_blocks(non_images, content_width)
+    image_layout = classify_image_layout(blocks, non_images, body_font_pt) if has_image else "none"
+
+    if image_layout == "right":
+        content_width = SPLIT_CONTENT_WIDTH
+        avail_h = MAX_CONTENT_BOTTOM - CONTENT_TOP_START
+        chosen_font_pt, compact_mode = choose_best_fit_for_section(
+            non_images, content_width, body_font_pt, min_font_pt, available_h=avail_h
+        )
+    elif image_layout in ("top", "bottom"):
+        content_width = FULL_CONTENT_WIDTH
+        chosen_font_pt = max(body_font_pt, 14.0)
+        compact_mode = False
+    else:
+        content_width = FULL_CONTENT_WIDTH
+        avail_h = MAX_CONTENT_BOTTOM - CONTENT_TOP_START
+        chosen_font_pt, compact_mode = choose_best_fit_for_section(
+            non_images, content_width, body_font_pt, min_font_pt, available_h=avail_h
+        )
+
+    sub_font_pt = max(8.5, chosen_font_pt - 1.0)
+    prepared_blocks = expand_splittable_blocks(non_images, content_width, chosen_font_pt, compact=compact_mode)
 
     slide_num = start_slide_num
     part_idx = 1
+
+    # Compute exact stacked geometry when image is placed above or below 1-2 lines of text
+    stacked_text_top = CONTENT_TOP_START
+    stacked_img_top = 1.06
+    stacked_img_max_h = 3.15
+    if image_layout in ("top", "bottom") and non_images:
+        txt_h = max(0.45, estimate_blocks_total_height(prepared_blocks, content_width, chosen_font_pt, compact=False) + 0.08)
+        if image_layout == "top":
+            stacked_img_top = 1.05
+            stacked_img_max_h = max(2.40, MAX_CONTENT_BOTTOM - stacked_img_top - txt_h - 0.14)
+            stacked_text_top = stacked_img_top + stacked_img_max_h + 0.10
+        else:  # "bottom"
+            stacked_text_top = 1.04
+            stacked_img_top = stacked_text_top + txt_h + 0.10
+            stacked_img_max_h = max(2.40, MAX_CONTENT_BOTTOM - stacked_img_top)
 
     def open_slide(part_number: int, include_image: bool):
         title_for_slide = slide_title if part_number == 1 else f"{strip_md_inline(slide_title)} (Cont.)"
         s = create_clean_slide(prs, using_template, slide_num, is_cover=False)
         set_slide_title(s, title_for_slide, using_template)
+        cur_layout = image_layout if include_image else "none"
+
         if include_image and img_path is not None:
-            add_picture_fit(s, img_path, left=6.10, top=1.25, max_w=3.45, max_h=3.55)
+            if cur_layout == "right":
+                add_picture_fit(
+                    s,
+                    img_path,
+                    left=IMAGE_RIGHT_LEFT,
+                    top=IMAGE_RIGHT_TOP,
+                    max_w=IMAGE_RIGHT_MAX_W,
+                    max_h=IMAGE_RIGHT_MAX_H,
+                    width_px_hint=img_width_px,
+                    respect_width_hint=True,
+                )
+            elif cur_layout in ("top", "bottom"):
+                add_picture_fit(
+                    s,
+                    img_path,
+                    left=CONTENT_LEFT,
+                    top=stacked_img_top,
+                    max_w=FULL_CONTENT_WIDTH,
+                    max_h=stacked_img_max_h,
+                    width_px_hint=img_width_px,
+                    respect_width_hint=False,
+                )
+
         html_rec = {
             "type": "content",
             "num": slide_num,
             "title": strip_md_inline(title_for_slide),
             "blocks": [],
             "image": img_path if include_image else None,
+            "image_layout": cur_layout,
+            "font_pt": chosen_font_pt,
         }
         html_slides.append(html_rec)
         return s, html_rec
 
     slide, current_html = open_slide(part_idx, has_image)
-    cursor_top = CONTENT_TOP_START
+    cursor_top = stacked_text_top if image_layout in ("top", "bottom") else CONTENT_TOP_START
+    center_stacked_text = image_layout in ("top", "bottom")
 
-    for block in prepared_blocks:
+    for b_idx, block in enumerate(prepared_blocks):
         if block["type"] == "table":
-            est_h = estimate_table_height_in(block["rows"], content_width)
-            gap = 0.16
+            est_h = estimate_table_height_in(block["rows"], content_width, chosen_font_pt, compact=compact_mode)
+            gap = 0.06 if compact_mode else 0.09
+        elif block["type"] == "callout":
+            est_h = estimate_text_height_in(
+                block["text"], content_width - 0.28, chosen_font_pt + 0.5, is_bullet=False, compact=compact_mode
+            ) + 0.12
+            gap = 0.05 if compact_mode else 0.08
+        elif block["type"] == "subheading":
+            top_pad = 0.05 if (b_idx > 0 and cursor_top > CONTENT_TOP_START + 0.05) else 0.0
+            cursor_top += top_pad
+            est_h = estimate_text_height_in(
+                block["text"], content_width, chosen_font_pt + 1.5, is_bullet=False, compact=compact_mode
+            )
+            gap = 0.03 if compact_mode else 0.05
         elif block["type"] == "paragraph":
-            est_h = estimate_text_height_in(block["text"], content_width, 14.0, is_bullet=False)
-            gap = 0.12
+            est_h = estimate_text_height_in(
+                block["text"], content_width, chosen_font_pt, is_bullet=False, compact=compact_mode
+            )
+            gap = 0.04 if compact_mode else 0.06
         elif block["type"] == "bullets":
             est_h = sum(
-                estimate_text_height_in(btxt, content_width, 14.0 if lvl == 0 else 13.0, is_bullet=True)
+                estimate_text_height_in(
+                    btxt,
+                    content_width,
+                    chosen_font_pt if lvl == 0 else sub_font_pt,
+                    is_bullet=True,
+                    compact=compact_mode,
+                )
                 for lvl, btxt in block["items"]
             )
-            gap = 0.12
+            gap = 0.04 if compact_mode else 0.06
         else:
             continue
 
-        # Start a new continuation slide if this block would overflow the bottom margin
+        # Start a continuation slide ONLY if this block genuinely overflows the bottom margin
         if cursor_top > CONTENT_TOP_START + 0.05 and (cursor_top + est_h > MAX_CONTENT_BOTTOM):
             slide_num += 1
             part_idx += 1
             slide, current_html = open_slide(part_idx, include_image=False)
             cursor_top = CONTENT_TOP_START
+            center_stacked_text = False
 
         render_h = min(est_h, MAX_CONTENT_BOTTOM - cursor_top)
 
         if block["type"] == "table":
-            render_styled_table(slide, block["rows"], CONTENT_LEFT, cursor_top, content_width, render_h)
-        elif block["type"] == "paragraph":
+            render_styled_table(
+                slide, block["rows"], CONTENT_LEFT, cursor_top, content_width, render_h, chosen_font_pt, compact=compact_mode
+            )
+        elif block["type"] == "callout":
+            card = slide.shapes.add_shape(
+                MSO_SHAPE.ROUNDED_RECTANGLE, Inches(CONTENT_LEFT), Inches(cursor_top), Inches(content_width), Inches(render_h)
+            )
+            card.adjustments[0] = 0.08
+            card.fill.solid()
+            card.fill.fore_color.rgb = COLOR_CARD_BG
+            card.line.fill.background()
+            tf = card.text_frame
+            tf.word_wrap = True
+            tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+            tf.margin_left = Inches(0.14)
+            tf.margin_right = Inches(0.14)
+            p = tf.paragraphs[0]
+            p.alignment = PP_ALIGN.CENTER
+            add_formatted_runs(p, block["text"], base_size_pt=chosen_font_pt + 0.5, base_color=COLOR_DARK)
+        elif block["type"] == "subheading":
             tb = slide.shapes.add_textbox(Inches(CONTENT_LEFT), Inches(cursor_top), Inches(content_width), Inches(render_h))
             tf = tb.text_frame
             tf.word_wrap = True
             tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = 0
             p = tf.paragraphs[0]
             p.alignment = PP_ALIGN.LEFT
-            add_formatted_runs(p, block["text"], base_size_pt=14.0, base_color=COLOR_DARK)
+            add_formatted_runs(
+                p, block["text"], base_size_pt=chosen_font_pt + 1.5, base_color=COLOR_CRIMSON, base_bold=True
+            )
+        elif block["type"] == "paragraph":
+            tb = slide.shapes.add_textbox(Inches(CONTENT_LEFT), Inches(cursor_top), Inches(content_width), Inches(render_h))
+            tf = tb.text_frame
+            tf.word_wrap = True
+            tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = 0
+            p = tf.paragraphs[0]
+            p.alignment = PP_ALIGN.CENTER if center_stacked_text else PP_ALIGN.LEFT
+            add_formatted_runs(p, block["text"], base_size_pt=chosen_font_pt, base_color=COLOR_DARK)
         elif block["type"] == "bullets":
             tb = slide.shapes.add_textbox(Inches(CONTENT_LEFT), Inches(cursor_top), Inches(content_width), Inches(render_h))
             tf = tb.text_frame
@@ -916,9 +1363,11 @@ def build_content_slides(
             for idx_b, (lvl, btext) in enumerate(block["items"]):
                 p = tf.paragraphs[0] if idx_b == 0 else tf.add_paragraph()
                 p.alignment = PP_ALIGN.LEFT
-                p.space_after = Pt(5)
+                p.space_after = Pt(2.5 if compact_mode else 4.0)
                 set_bullet_xml(p, level=lvl)
-                add_formatted_runs(p, btext, base_size_pt=14.0 if lvl == 0 else 13.0, base_color=COLOR_DARK)
+                add_formatted_runs(
+                    p, btext, base_size_pt=chosen_font_pt if lvl == 0 else sub_font_pt, base_color=COLOR_DARK
+                )
 
         current_html["blocks"].append(block)
         cursor_top += render_h + gap
@@ -927,7 +1376,7 @@ def build_content_slides(
 
 
 # ---------------------------------------------------------------------------
-# HTML Presentation Builder (Visual Match + Live Streamlit Iframes)
+# HTML Presentation Builder (Visual Match + Live Streamlit Iframes + Print CSS)
 # ---------------------------------------------------------------------------
 def image_to_data_uri(img_path: Optional[Path]) -> str:
     """Encode local PNG/JPG into a self-contained base64 data URI for the HTML deck."""
@@ -939,10 +1388,13 @@ def image_to_data_uri(img_path: Optional[Path]) -> str:
     return f"data:{mime};base64,{b64}"
 
 
-def render_html_deck(html_slides: List[Dict], site_name: str, output_html_path: Path):
-    """Generate a single-file 16:9 HTML slide deck with live Streamlit iframes."""
+def render_html_deck(html_slides: List[Dict], site_name: str, output_html_path: Path, body_font_pt: float = 12.5):
+    """Generate a single-file 16:9 HTML slide deck with matching layouts, print page breaks, and live Streamlit iframes."""
     total = len(html_slides)
     rendered_cards: List[str] = []
+    default_scale = body_font_pt / 12.5
+    body_vw = round(1.22 * default_scale, 3)
+    body_max_rem = round(1.04 * default_scale, 3)
 
     for idx, s in enumerate(html_slides):
         active_cls = " active" if idx == 0 else ""
@@ -975,23 +1427,7 @@ def render_html_deck(html_slides: List[Dict], site_name: str, output_html_path: 
             <div class="slide-num-tab">{s_num}</div>
             """
 
-            if s_type == "sms":
-                sms = s["sms_info"]
-                res_link = (
-                    f'<a class="results-pill" href="{html.escape(s["results_url"], quote=True)}" target="_blank" rel="noopener">Latest Results (Live Dashboard) &rarr;</a>'
-                    if s.get("results_url") else ""
-                )
-                body_html = f"""
-                <div class="slide-body sms-body">
-                  <div class="sms-card">
-                    <p class="sms-line1">To start the activity, send <strong>{html.escape(sms['keyword'])}</strong> by text or WhatsApp to</p>
-                    <p class="sms-phone">{html.escape(sms['phone'])}</p>
-                    <p class="sms-line3">To end the activity at any time send <strong>{html.escape(sms['end_cmd'])}</strong></p>
-                  </div>
-                  {res_link}
-                </div>
-                """
-            elif s_type == "streamlit":
+            if s_type == "streamlit":
                 url_esc = html.escape(s["iframe_url"], quote=True)
                 body_html = f"""
                 <div class="slide-body streamlit-body">
@@ -1013,10 +1449,18 @@ def render_html_deck(html_slides: List[Dict], site_name: str, output_html_path: 
                 </div>
                 """
             else:
+                slide_font_pt = s.get("font_pt", body_font_pt)
+                slide_scale = round(slide_font_pt / body_font_pt, 3) if body_font_pt else 1.0
+                scale_style = f' style="--slide-scale: {slide_scale};"' if abs(slide_scale - 1.0) > 0.01 else ""
+
                 blocks_html: List[str] = []
                 for b in s.get("blocks", []):
-                    if b["type"] == "paragraph":
+                    if b["type"] == "subheading":
+                        blocks_html.append(f'<h3 class="body-subheading">{md_inline_to_html(b["text"])}</h3>')
+                    elif b["type"] == "paragraph":
                         blocks_html.append(f'<p class="body-para">{md_inline_to_html(b["text"])}</p>')
+                    elif b["type"] == "callout":
+                        blocks_html.append(f'<div class="inline-callout">{md_inline_to_html(b["text"])}</div>')
                     elif b["type"] == "bullets":
                         lis = []
                         for lvl, btxt in b["items"]:
@@ -1025,26 +1469,47 @@ def render_html_deck(html_slides: List[Dict], site_name: str, output_html_path: 
                         blocks_html.append(f'<ul class="body-list">{"".join(lis)}</ul>')
                     elif b["type"] == "table":
                         rows = b["rows"]
+                        col_widths = compute_table_col_widths(rows, FULL_CONTENT_WIDTH)
+                        col_tags = "".join(
+                            f'<col style="width: {round((cw / FULL_CONTENT_WIDTH) * 100, 1)}%;">'
+                            for cw in col_widths
+                        )
                         ths = "".join(f"<th>{md_inline_to_html(c)}</th>" for c in rows[0])
                         trs = []
                         for r in rows[1:]:
                             tds = "".join(f"<td>{md_inline_to_html(c)}</td>" for c in r)
                             trs.append(f"<tr>{tds}</tr>")
                         blocks_html.append(
-                            f'<table class="styled-table"><thead><tr>{ths}</tr></thead><tbody>{"".join(trs)}</tbody></table>'
+                            f'<table class="styled-table"><colgroup>{col_tags}</colgroup>'
+                            f'<thead><tr>{ths}</tr></thead><tbody>{"".join(trs)}</tbody></table>'
                         )
 
                 img_uri = image_to_data_uri(s.get("image"))
-                if img_uri:
+                img_layout = s.get("image_layout", "right")
+                if img_uri and img_layout == "top":
                     body_html = f"""
-                    <div class="slide-body split-layout">
+                    <div class="slide-body stacked-top"{scale_style}>
+                      <div class="stacked-image"><img src="{img_uri}" alt="Slide visual"></div>
+                      <div class="stacked-caption">{''.join(blocks_html)}</div>
+                    </div>
+                    """
+                elif img_uri and img_layout == "bottom":
+                    body_html = f"""
+                    <div class="slide-body stacked-bottom"{scale_style}>
+                      <div class="stacked-caption">{''.join(blocks_html)}</div>
+                      <div class="stacked-image"><img src="{img_uri}" alt="Slide visual"></div>
+                    </div>
+                    """
+                elif img_uri:
+                    body_html = f"""
+                    <div class="slide-body split-layout"{scale_style}>
                       <div class="content-col">{''.join(blocks_html)}</div>
                       <div class="image-col"><img src="{img_uri}" alt="Slide visual"></div>
                     </div>
                     """
                 else:
                     body_html = f"""
-                    <div class="slide-body">
+                    <div class="slide-body"{scale_style}>
                       <div class="content-col full">{''.join(blocks_html)}</div>
                     </div>
                     """
@@ -1078,6 +1543,7 @@ def render_html_deck(html_slides: List[Dict], site_name: str, output_html_path: 
     --alt-row: #F3F3F3;
     --border: #D0D0D0;
     --link: #0563C1;
+    --slide-scale: 1;
   }}
   * {{ box-sizing: border-box; }}
   body {{
@@ -1155,7 +1621,6 @@ def render_html_deck(html_slides: List[Dict], site_name: str, output_html_path: 
   body.scroll-mode .slide {{
     display: block;
   }}
-  /* Slide Chrome matching Scenario Course_NTICCReno_October 2026.pptx */
   .chrome-sidebar {{
     position: absolute; left: 0; top: 0; bottom: 0; width: 2.2%;
     background: var(--sidebar);
@@ -1208,67 +1673,81 @@ def render_html_deck(html_slides: List[Dict], site_name: str, output_html_path: 
   /* Content Slides */
   .slide-body {{
     position: absolute;
-    left: 5.8%; top: 20.5%; right: 5.2%; bottom: 8.5%;
+    left: 5.2%; top: 18.2%; right: 4.8%; bottom: 8.5%;
     display: flex; flex-direction: column;
     overflow: hidden;
   }}
   .slide-body.split-layout {{
-    flex-direction: row; gap: 2.5%; align-items: flex-start;
+    flex-direction: row; gap: 2.2%; align-items: flex-start;
   }}
+  .slide-body.stacked-top,
+  .slide-body.stacked-bottom {{
+    flex-direction: column; align-items: center; justify-content: center; gap: 0.65rem;
+  }}
+  .stacked-image {{
+    flex: 1 1 auto; min-height: 0; width: 100%;
+    display: flex; align-items: center; justify-content: center;
+  }}
+  .stacked-image img {{ max-width: 100%; max-height: 100%; object-fit: contain; }}
+  .stacked-caption {{ flex: 0 0 auto; width: 100%; text-align: center; }}
+  .stacked-caption .body-para {{ margin-bottom: 0; }}
   .content-col {{ flex: 1; min-width: 0; }}
   .image-col {{
-    flex: 0 0 36%; height: 95%;
+    flex: 0 0 34%; height: 92%;
     display: flex; align-items: center; justify-content: center;
   }}
   .image-col img {{ max-width: 100%; max-height: 100%; object-fit: contain; }}
+  .body-subheading {{
+    margin: calc(0.42rem * var(--slide-scale)) 0 calc(0.24rem * var(--slide-scale)) 0;
+    color: var(--crimson);
+    font-weight: 700;
+    font-size: calc(clamp(0.82rem, {round(body_vw * 1.12, 3)}vw, {round(body_max_rem * 1.12, 3)}rem) * var(--slide-scale));
+    line-height: 1.3;
+  }}
+  .body-subheading:first-child {{ margin-top: 0; }}
   .body-para {{
-    margin: 0 0 0.65rem 0;
-    font-size: clamp(0.82rem, 1.32vw, 1.12rem);
-    line-height: 1.42;
+    margin: 0 0 calc(0.40rem * var(--slide-scale)) 0;
+    font-size: calc(clamp(0.74rem, {body_vw}vw, {body_max_rem}rem) * var(--slide-scale));
+    line-height: 1.34;
+  }}
+  .inline-callout {{
+    background: var(--card-bg);
+    border-radius: 8px;
+    padding: calc(0.42rem * var(--slide-scale)) 0.85rem;
+    margin: 0 0 calc(0.42rem * var(--slide-scale)) 0;
+    text-align: center;
+    font-size: calc(clamp(0.78rem, {round(body_vw * 1.05, 3)}vw, {round(body_max_rem * 1.05, 3)}rem) * var(--slide-scale));
   }}
   .body-list {{
-    margin: 0 0 0.65rem 1.35rem; padding: 0;
-    font-size: clamp(0.82rem, 1.32vw, 1.12rem);
-    line-height: 1.4;
+    margin: 0 0 calc(0.40rem * var(--slide-scale)) 1.30rem; padding: 0;
+    font-size: calc(clamp(0.74rem, {body_vw}vw, {body_max_rem}rem) * var(--slide-scale));
+    line-height: 1.33;
   }}
-  .body-list li {{ margin-bottom: 0.42rem; }}
+  .body-list li {{ margin-bottom: calc(0.26rem * var(--slide-scale)); }}
   .body-list li.sub-bullet {{
-    margin-left: 1.25rem;
-    font-size: clamp(0.78rem, 1.2vw, 1.02rem);
+    margin-left: 1.20rem;
+    font-size: calc(clamp(0.69rem, {round(body_vw * 0.92, 3)}vw, {round(body_max_rem * 0.92, 3)}rem) * var(--slide-scale));
   }}
   .inline-code {{ color: var(--crimson); font-weight: 700; font-family: inherit; }}
   a {{ color: var(--link); text-decoration: none; font-weight: 600; }}
   a:hover {{ text-decoration: underline; }}
   /* Tables */
   .styled-table {{
-    width: 100%; border-collapse: collapse; margin-bottom: 0.65rem;
-    font-size: clamp(0.72rem, 1.08vw, 0.94rem);
+    width: 100%; border-collapse: collapse; margin-bottom: 0.42rem;
+    font-size: calc(clamp(0.67rem, {round(body_vw * 0.86, 3)}vw, {round(body_max_rem * 0.88, 3)}rem) * var(--slide-scale));
   }}
   .styled-table th {{
     background: var(--crimson); color: #ffffff; text-align: left;
-    padding: 0.42rem 0.55rem; border: 1px solid var(--crimson);
+    padding: calc(0.30rem * var(--slide-scale)) 0.46rem; border: 1px solid var(--crimson);
   }}
   .styled-table td {{
-    padding: 0.38rem 0.55rem; border: 1px solid var(--border);
-    vertical-align: middle; line-height: 1.32;
+    padding: calc(0.28rem * var(--slide-scale)) 0.46rem; border: 1px solid var(--border);
+    vertical-align: middle; line-height: 1.26;
   }}
   .styled-table tbody tr:nth-child(odd) {{ background: var(--alt-row); }}
   .styled-table tbody tr:nth-child(even) {{ background: #ffffff; }}
-  /* SMS Activity Card */
-  .sms-body {{ justify-content: center; align-items: center; }}
-  .sms-card {{
-    width: 94%; background: var(--card-bg); border-radius: 14px;
-    padding: 2.1rem 2rem; text-align: center;
-  }}
-  .sms-line1 {{ margin: 0 0 0.6rem 0; font-size: clamp(1.05rem, 2.0vw, 1.7rem); }}
-  .sms-phone {{ margin: 0 0 0.8rem 0; font-size: clamp(1.35rem, 2.6vw, 2.2rem); font-weight: 700; }}
-  .sms-line3 {{ margin: 0; font-size: clamp(0.95rem, 1.8vw, 1.5rem); }}
-  .results-pill {{
-    align-self: flex-start; margin-left: 3%; margin-top: 0.65rem;
-    font-size: clamp(0.75rem, 1.05vw, 0.92rem);
-  }}
   /* Live Streamlit Iframe Slide */
-  .streamlit-body {{ top: 19.5%; bottom: 6.5%; }}
+  .streamlit-body {{ top: 19.2%; bottom: 6.5%; }}
   .live-frame {{
     position: relative; flex: 1; width: 100%;
     border: 1px solid var(--border); background: #fff;
@@ -1290,6 +1769,23 @@ def render_html_deck(html_slides: List[Dict], site_name: str, output_html_path: 
   .streamlit-footer {{
     text-align: right; padding-top: 0.35rem;
     font-size: clamp(0.68rem, 0.92vw, 0.82rem);
+  }}
+  /* Print / PDF Export: enforce page break after every slide */
+  @media print {{
+    body {{ background: #ffffff; }}
+    .toolbar {{ display: none; }}
+    main.deck-stage {{ display: block; padding: 0; }}
+    .slide {{
+      display: block !important;
+      width: 100%;
+      box-shadow: none;
+      page-break-after: always;
+      break-after: page;
+    }}
+    .slide:last-child {{
+      page-break-after: auto;
+      break-after: auto;
+    }}
   }}
 </style>
 </head>
@@ -1389,6 +1885,45 @@ def find_screenshot_for_md(md_filename: str, docs_dir: Path) -> Optional[Path]:
 
 
 # ---------------------------------------------------------------------------
+# Cover Slide Image Selection (First Image in index.md)
+# ---------------------------------------------------------------------------
+def extract_cover_hero_image(
+    parsed_index: Dict,
+    docs_dir: Path,
+    rel_md: str,
+    cover_image_override: Optional[str] = None,
+) -> Tuple[Optional[Path], Optional[int]]:
+    """
+    Determine the Title/Cover slide image:
+      1. If --cover-image is explicitly passed, use that.
+      2. Otherwise, pick the FIRST image found in index.md (Markdown or HTML <img>)
+         and remove that image block from index.md so it doesn't repeat on Slide 2.
+      3. Fallback to cover.png / hero.png / evacuated.png if index.md has no image.
+    """
+    if cover_image_override:
+        p = Path(cover_image_override)
+        if p.exists():
+            return p, None
+        resolved = resolve_doc_image(cover_image_override, docs_dir, rel_md)
+        if resolved:
+            return resolved, None
+
+    for sec in parsed_index["sections"]:
+        for idx_b, b in enumerate(sec["blocks"]):
+            if b["type"] == "image":
+                resolved = resolve_doc_image(b["src"], docs_dir, rel_md)
+                if resolved is not None:
+                    sec["blocks"].pop(idx_b)
+                    return resolved, b.get("width_px")
+
+    for fallback_name in ("cover.png", "hero.png", "evacuated.png"):
+        candidate = docs_dir / fallback_name
+        if candidate.exists():
+            return candidate, None
+    return None, None
+
+
+# ---------------------------------------------------------------------------
 # Main Conversion Pipeline
 # ---------------------------------------------------------------------------
 def convert_zip_to_pptx_and_html(
@@ -1397,31 +1932,35 @@ def convert_zip_to_pptx_and_html(
     output_html: Optional[str] = None,
     template_pptx: Optional[str] = None,
     capture_live: bool = False,
+    body_font_pt: float = 12.5,
+    min_font_pt: float = 9.5,
+    cover_image: Optional[str] = None,
 ):
     tmp_dir = tempfile.mkdtemp(prefix="gh_md_to_pptx_")
     try:
         _, docs_dir, mkdocs_path = extract_zip_and_locate_project(zip_path, tmp_dir)
-        site_name, nav_files = load_mkdocs_config(mkdocs_path, docs_dir)
+        site_name, nav_entries = load_mkdocs_config(mkdocs_path, docs_dir)
         prs, using_template = initialize_presentation(template_pptx)
 
         parsed_pages: List[Tuple[str, Dict]] = []
-        iframe_by_prefix: Dict[str, str] = {}
-        for rel_md in nav_files:
+        for nav_label, rel_md in nav_entries:
             md_path = docs_dir / rel_md
             if not md_path.exists():
                 continue
-            parsed = parse_markdown_sections(md_path.read_text(encoding="utf-8", errors="replace"))
+            parsed = parse_markdown_sections(
+                md_path.read_text(encoding="utf-8", errors="replace"),
+                fallback_title=nav_label,
+            )
             parsed_pages.append((rel_md, parsed))
-            if parsed["iframe_url"]:
-                prefix = re.sub(r"_2\.md$", "", rel_md)
-                iframe_by_prefix[prefix] = parsed["iframe_url"]
 
         slide_counter = 1
         html_slides: List[Dict] = []
 
         for idx, (rel_md, parsed) in enumerate(parsed_pages):
-            # 1. Cover slide from index.md + mkdocs.yml site_name
+            # 1. Cover slide + Slide 2 (plus any post-page-break sections in index.md)
             if idx == 0 and Path(rel_md).name.lower() == "index.md":
+                hero_img, hero_w_px = extract_cover_hero_image(parsed, docs_dir, rel_md, cover_image)
+
                 first_sec = parsed["sections"][0]
                 subtitle = ""
                 remaining_blocks = []
@@ -1431,24 +1970,39 @@ def convert_zip_to_pptx_and_html(
                     else:
                         remaining_blocks.append(b)
 
-                hero_img = None
-                for candidate_name in ("evacuated.png", "hero.png", "cover.png"):
-                    if (docs_dir / candidate_name).exists():
-                        hero_img = docs_dir / candidate_name
-                        break
-
-                build_cover_slide(prs, using_template, site_name, subtitle, hero_img, html_slides)
+                build_cover_slide(
+                    prs, using_template, site_name, subtitle, hero_img, html_slides, hero_width_px=hero_w_px
+                )
                 slide_counter += 1
 
                 if remaining_blocks:
                     slide_counter = build_content_slides(
-                        prs, using_template, slide_counter, parsed["page_title"], remaining_blocks, docs_dir, html_slides
+                        prs,
+                        using_template,
+                        slide_counter,
+                        first_sec["title"] or parsed["page_title"],
+                        remaining_blocks,
+                        docs_dir,
+                        rel_md,
+                        html_slides,
+                        body_font_pt=body_font_pt,
+                        min_font_pt=min_font_pt,
                     )
 
                 for extra_sec in parsed["sections"][1:]:
-                    slide_counter = build_content_slides(
-                        prs, using_template, slide_counter, extra_sec["title"], extra_sec["blocks"], docs_dir, html_slides
-                    )
+                    if extra_sec["blocks"]:
+                        slide_counter = build_content_slides(
+                            prs,
+                            using_template,
+                            slide_counter,
+                            extra_sec["title"] or parsed["page_title"],
+                            extra_sec["blocks"],
+                            docs_dir,
+                            rel_md,
+                            html_slides,
+                            body_font_pt=body_font_pt,
+                            min_font_pt=min_font_pt,
+                        )
                 continue
 
             # 2. Results page (*_2.md with Streamlit <iframe>)
@@ -1467,46 +2021,28 @@ def convert_zip_to_pptx_and_html(
                 slide_counter += 1
                 continue
 
-            # 3. Standard content sections + optional SMS Activity Callout slide
+            # 3. Standard content pages (1 Markdown page = 1 slide unit, split on any page break or vertical overflow)
             for sec in parsed["sections"]:
-                cleaned_blocks = [
-                    b for b in sec["blocks"]
-                    if not (
-                        b["type"] == "paragraph"
-                        and re.match(r"^To start the activity,\s*send\b", b["text"], re.IGNORECASE)
-                    )
-                ]
-                if cleaned_blocks:
+                if sec["blocks"]:
                     slide_counter = build_content_slides(
                         prs,
                         using_template,
                         slide_counter,
                         sec["title"] or parsed["page_title"],
-                        cleaned_blocks,
+                        sec["blocks"],
                         docs_dir,
+                        rel_md,
                         html_slides,
+                        body_font_pt=body_font_pt,
+                        min_font_pt=min_font_pt,
                     )
-
-            if parsed["sms_callout"]:
-                prefix = re.sub(r"_1\.md$", "", rel_md)
-                results_url = iframe_by_prefix.get(prefix)
-                build_sms_activity_slide(
-                    prs,
-                    using_template,
-                    slide_counter,
-                    parsed["page_title"],
-                    parsed["sms_callout"],
-                    results_url,
-                    html_slides,
-                )
-                slide_counter += 1
 
         out_pptx_path = Path(output_pptx)
         out_pptx_path.parent.mkdir(parents=True, exist_ok=True)
         prs.save(str(out_pptx_path))
 
         out_html_path = Path(output_html) if output_html else out_pptx_path.with_suffix(".html")
-        render_html_deck(html_slides, site_name, out_html_path)
+        render_html_deck(html_slides, site_name, out_html_path, body_font_pt=body_font_pt)
 
         print(f"Successfully generated PPTX: {out_pptx_path} ({len(prs.slides)} slides)")
         print(f"Successfully generated HTML: {out_html_path} ({len(html_slides)} slides with live Streamlit embeds)")
@@ -1533,12 +2069,38 @@ def main():
         help="Optional reference .pptx template to inherit Slide Master, theme, and logos from",
     )
     parser.add_argument(
+        "--font-size",
+        type=float,
+        default=12.5,
+        help="Preferred body text font size in points (default: 12.5)",
+    )
+    parser.add_argument(
+        "--min-font-size",
+        type=float,
+        default=9.5,
+        help="Minimum auto-fit body font size in points before splitting a slide (default: 9.5)",
+    )
+    parser.add_argument(
+        "--cover-image",
+        default=None,
+        help="Optional image filename/path for Slide 1 cover (defaults to the first image in index.md)",
+    )
+    parser.add_argument(
         "--capture-live",
         action="store_true",
         help="Capture fresh screenshots of embedded Streamlit iframes for the PPTX via Playwright",
     )
     args = parser.parse_args()
-    convert_zip_to_pptx_and_html(args.zip_file, args.output, args.html, args.template, args.capture_live)
+    convert_zip_to_pptx_and_html(
+        args.zip_file,
+        args.output,
+        args.html,
+        args.template,
+        args.capture_live,
+        args.font_size,
+        args.min_font_size,
+        args.cover_image,
+    )
 
 
 if __name__ == "__main__":
